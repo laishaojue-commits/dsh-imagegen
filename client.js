@@ -4,7 +4,20 @@ window.__ModuleLoader__.load({
     const module = { exports: {} }
     const exports = module.exports
     const React = require('react')
-    const { createSnapshotStore } = require('@deepseek-ai/dsh-client-runtime/client')
+    // Standalone snapshot store: DSH 0.2 removed dsh-client-runtime/client.
+    function createSnapshotStore(initial) {
+      let snapshot = initial
+      const listeners = new Set()
+      return {
+        getSnapshot: () => snapshot,
+        subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+        set(next) {
+          if (Object.is(next, snapshot)) return
+          snapshot = next
+          for (const listener of [...listeners]) listener()
+        },
+      }
+    }
 
     const NS = 'imagegen'
     const SETTINGS_DESCRIBE_PATH = '/api/imagegen/settings/describe'
@@ -12,19 +25,19 @@ window.__ModuleLoader__.load({
     const PROTOCOLS = ['auto', 'gemini', 'image2']
     const QUALITIES = ['low', 'medium', 'high', 'auto']
     const DEFAULTS = {
-      protocol: 'image2',
+      protocol: 'gemini',
       url: '',
       apiKeyEnv: 'IMAGEGEN_API_KEY',
       apiKeyHeader: '',
       apiKeyPrefix: '',
-      defaultModel: 'gpt-image-2',
+      defaultModel: 'gemini-3.1-flash-image',
       defaultQuality: 'medium',
       outputDirectory: 'generated-images',
     }
 
     const zh = {
       title: '生图服务',
-      description: '配置 image_generate 使用的协议、URL、Key 与默认模型。',
+      description: '配置生图接口与默认模型。默认锁定生图模型；短冷却等待后仅重试一次，长冷却提示剩余时间。',
       expand: '展开设置',
       collapse: '收起设置',
       unsaved: '未保存',
@@ -61,7 +74,7 @@ window.__ModuleLoader__.load({
 
     const en = {
       title: 'Image generation',
-      description: 'Configure the protocol, URL, key, and default model used by image_generate.',
+      description: 'Configure the image endpoint and model. Model overrides are locked by default; short cooldowns retry once and long cooldowns return a wait time.',
       expand: 'Show settings',
       collapse: 'Hide settings',
       unsaved: 'Unsaved',
@@ -406,14 +419,14 @@ window.__ModuleLoader__.load({
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'imagegen: dictionaries')
       const scope = new ImagegenSettingsScope()
       const controller = new SettingsCardController(scope)
-      ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-        name: 'settings.plugin.item',
+      ctx.effect(() => ctx.slots.inject('plugins.item', () => ctx.slots.register({
+        name: 'plugins.item',
         key: 'imagegen',
         id: 'imagegen',
         order: 80,
         locale: NS,
         inject: () => controller.inject(),
-      }, ImagegenSettingsCard))
+      }, ImagegenSettingsCard)), 'imagegen: settings card')
     }
 
     exports.apply = apply

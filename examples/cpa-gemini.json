@@ -1,0 +1,8 @@
+{
+  "protocol": "gemini",
+  "url": "http://127.0.0.1:8317",
+  "apiKeyEnv": "IMAGEGEN_API_KEY",
+  "apiKeyHeader": "Authorization",
+  "apiKeyPrefix": "Bearer ",
+  "defaultModel": "gemini-3.1-flash-image"
+}

@@ -2,9 +2,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, extname, isAbsolute, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import z from '@deepseek-ai/schemastery'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { z, defineTool } from './runtime-imports.js'
+import { createRequestPolicy, noImageError, selectModel } from './request-policy.js'
 
 const name = 'imagegen'
 const inject = ['tools', 'systemPrompt', 'webServer']
@@ -14,22 +13,26 @@ const IMAGE_SIZES = ['1K', '2K', '4K']
 const IMAGE2_SIZES = ['1024x1024', '1024x1536', '1536x1024', 'auto']
 const IMAGE2_QUALITIES = ['low', 'medium', 'high', 'auto']
 const PROTOCOLS = ['auto', 'gemini', 'image2']
-const SETTINGS_NAMESPACE = settingsNamespace('imagegen')
+const SETTINGS_NAMESPACE = 'imagegen'
 const SETTINGS_DESCRIBE_PATH = '/api/imagegen/settings/describe'
 const SETTINGS_MUTATE_PATH = '/api/imagegen/settings/mutate'
 
 const Config = z.object({
-  protocol: z.union(PROTOCOLS).default('image2').description('Image API protocol.'),
-  url: z.string().default('').description('API base URL or complete generation endpoint.'),
-  apiKey: z.string().role('secret').description('API credential. Leave empty to use apiKeyEnv.'),
-  apiKeyEnv: z.string().default('IMAGEGEN_API_KEY').description('Fallback environment variable containing the API credential.'),
-  apiKeyHeader: z.string().description('Optional credential header override.'),
-  apiKeyPrefix: z.string().description('Optional credential prefix override.'),
-  defaultModel: z.string().default('gpt-image-2').description('Default image generation model.'),
-  defaultQuality: z.union(IMAGE2_QUALITIES).default('medium').description('Default image2 quality.'),
-  outputDirectory: z.string().default('generated-images').description('Workspace-relative default output directory.'),
+  protocol: z.union(PROTOCOLS).default('gemini').description('Image API protocol.').volatile(),
+  url: z.string().default('').description('API base URL or complete generation endpoint.').volatile(),
+  apiKey: z.string().role('secret').description('API credential. Leave empty to use apiKeyEnv.').volatile(),
+  apiKeyEnv: z.string().default('IMAGEGEN_API_KEY').description('Fallback environment variable containing the API credential.').volatile(),
+  apiKeyHeader: z.string().description('Optional credential header override.').volatile(),
+  apiKeyPrefix: z.string().description('Optional credential prefix override.').volatile(),
+  defaultModel: z.string().default('gemini-3.1-flash-image').description('Default image generation model.').volatile(),
+  defaultQuality: z.union(IMAGE2_QUALITIES).default('medium').description('Default image2 quality.').volatile(),
+  outputDirectory: z.string().default('generated-images').description('Workspace-relative default output directory.').volatile(),
   timeoutMs: z.number().min(1).default(180000).hidden(),
   maxImageBytes: z.number().min(1).default(20 * 1024 * 1024).hidden(),
+  allowModelOverride: z.boolean().default(false).hidden(),
+  maxRetries: z.natural().max(2).default(1).hidden(),
+  maxCooldownWaitMs: z.natural().max(120000).default(60000).hidden(),
+  requestTimeoutMs: z.number().min(1).default(90000).hidden(),
   runtimeConfigPath: z.string().default('~/.dsh/dsh-imagegen.json').hidden(),
 })
 
@@ -93,7 +96,7 @@ function extensionFromMime(mimeType) {
 
 function extractGeminiResponse(payload) {
   const parts = payload?.candidates?.[0]?.content?.parts
-  if (!Array.isArray(parts)) throw new Error('Gemini image API returned no candidate content')
+  if (!Array.isArray(parts)) throw noImageError('Gemini')
 
   const text = parts
     .filter((part) => typeof part?.text === 'string')
@@ -109,12 +112,12 @@ function extractGeminiResponse(payload) {
       return { kind: 'base64', data: inline.data, mimeType, text }
     }
   }
-  throw new Error('Gemini image API response did not contain an image')
+  throw noImageError('Gemini')
 }
 
 function extractImage2Response(payload) {
   const item = Array.isArray(payload?.data) ? payload.data[0] : undefined
-  if (!item || typeof item !== 'object') throw new Error('image2 API response did not contain an image')
+  if (!item || typeof item !== 'object') throw noImageError('image2')
   const text = typeof item.revised_prompt === 'string' ? item.revised_prompt.trim() : ''
   if (typeof item.b64_json === 'string' && item.b64_json.length > 0) {
     return { kind: 'base64', data: item.b64_json, mimeType: 'image/png', text }
@@ -122,7 +125,7 @@ function extractImage2Response(payload) {
   if (typeof item.url === 'string' && item.url.length > 0) {
     return { kind: 'url', url: item.url, text }
   }
-  throw new Error('image2 API response contained neither b64_json nor url')
+  throw noImageError('image2')
 }
 
 async function parseError(response) {
@@ -213,6 +216,7 @@ async function loadRuntimeConfig(configPath, signal) {
 }
 
 async function resolveRuntimeConfig(settings, configPath, signal) {
+  if (!settings.url?.trim()) return loadRuntimeConfig(configPath, signal)
   try {
     return parseRuntimeConfig(settings, 'imagegen plugin settings')
   } catch (error) {
@@ -342,6 +346,7 @@ function settingsView(settings) {
 
 function installSettingsBridge(ctx) {
   ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber))
     settingsCtx.effect(() => {
       const guard = (request, response) => {
         if (!isLoopbackRequest(request)) {
@@ -408,27 +413,28 @@ function installSettingsBridge(ctx) {
   })
 }
 
+function readSettings(config) {
+  return Object.fromEntries(Object.entries(config).map(([key, value]) => [
+    key,
+    value && typeof value.get === 'function' ? value.get() : value,
+  ]))
+}
+
 function apply(ctx, config) {
-  validateSettings(config)
-  let current = () => config
-  installSettingsSection(ctx, SETTINGS_NAMESPACE, Config, config, {
-    setSource: (source) => {
-      current = source
-    },
-    onChange: () => {},
-    validate: validateSettings,
-  })
+  const current = () => readSettings(config)
+  validateSettings(current())
   installSettingsBridge(ctx)
+  const requests = createRequestPolicy({ onEvent: (event) => console.info('[dsh-imagegen]', JSON.stringify(event)) })
 
   ctx.systemPrompt.section({
     name: 'tool:image_generate',
     order: 112,
-    text: 'Use image_generate when the user asks you to create or generate an image. It reads the imagegen plugin settings for every call and supports Gemini generateContent plus image2/OpenAI Images APIs. Write the generated file into the current session workspace and report its path. Never expose image API credentials.',
+    text: 'Use image_generate for image creation, normally WITHOUT a model argument: use its configured image model, not the chat model. The tool manages bounded cooldown waiting itself. On IMAGE_COOLDOWN, report retry_after_seconds and END the turn; do not immediately call again. On IMAGE_MODEL_LOCKED, use the configured default once. On IMAGE_NO_IMAGE, IMAGE_HTTP_ERROR, IMAGE_NETWORK or IMAGE_TIMEOUT, explain the error and END the turn. Do not switch to other models, probe APIs with curl/pwsh, search configurations or scan files/processes as an automatic fallback. Change settings only when the user asks to troubleshoot. Gemini image models use generateContent, not /v1/images/generations. Save into the session workspace and report the path. Never expose credentials.',
   })
 
   ctx.tools.register(defineTool({
     name: 'image_generate',
-    description: 'Generate an image using the locally configured Gemini or image2/OpenAI-compatible API and save it in the current session workspace.',
+    description: 'Generate an image with the configured image model. Handles one bounded cooldown retry. On error, report it and stop: do not switch models or run diagnostic commands.',
     parameters: {
       prompt: {
         type: 'string',
@@ -437,7 +443,7 @@ function apply(ctx, config) {
       },
       model: {
         type: 'string',
-        description: 'Optional model override. Otherwise uses defaultModel from the runtime config file.',
+        description: 'Normally omit: use the configured image model. Overrides are rejected unless explicitly enabled in plugin configuration.',
       },
       aspect_ratio: {
         type: 'string',
@@ -475,6 +481,9 @@ function apply(ctx, config) {
           bytes: { type: 'integer', required: true },
           model: { type: 'string', required: true },
           protocol: { type: 'string', required: true },
+          elapsed_ms: { type: 'integer', required: true },
+          attempts: { type: 'integer', required: true },
+          waited_ms: { type: 'integer', required: true },
           text: { type: 'string' },
         },
       },
@@ -486,17 +495,20 @@ function apply(ctx, config) {
           `Bytes: ${value.bytes}`,
           `Model: ${value.model}`,
           `Protocol: ${value.protocol}`,
+          `Elapsed: ${(value.elapsed_ms / 1000).toFixed(1)}s; requests: ${value.attempts}; cooldown wait: ${(value.waited_ms / 1000).toFixed(1)}s`,
           ...(value.text ? [`Model text: ${value.text}`] : []),
         ].join('\n'),
       }],
     },
     timeoutMs: config.timeoutMs,
     async execute(args, exec) {
+      const started = Date.now()
       const active = current()
+      const signal = exec.signal ? AbortSignal.any([exec.signal, AbortSignal.timeout(active.timeoutMs)]) : AbortSignal.timeout(active.timeoutMs)
       const runtimeConfigPath = expandHome(active.runtimeConfigPath)
-      const runtime = await resolveRuntimeConfig(active, runtimeConfigPath, exec.signal)
+      const runtime = await resolveRuntimeConfig(active, runtimeConfigPath, signal)
       const prompt = requireNonBlank('prompt', args.prompt)
-      const model = args.model === undefined ? runtime.defaultModel : requireNonBlank('model', args.model)
+      const model = selectModel(args.model, runtime.defaultModel, active.allowModelOverride)
       const protocol = resolveProtocol(runtime.protocol, runtime.urlTemplate, model)
       const endpoint = resolveEndpoint(runtime.urlTemplate, model, protocol)
       const credential = credentialHeader(runtime, protocol)
@@ -529,22 +541,20 @@ function apply(ctx, config) {
         }
       }
 
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: exec.signal,
+      const { payload, attempts, waitedMs } = await requests.request({
+        endpoint, model, headers, body, signal,
+        timeoutMs: Math.max(1, active.timeoutMs - (Date.now() - started)),
+        requestTimeoutMs: active.requestTimeoutMs,
+        maxCooldownWaitMs: active.maxCooldownWaitMs,
+        maxRetries: active.maxRetries,
       })
-      if (!response.ok) throw new Error(`Image API request failed (${response.status}): ${await parseError(response)}`)
-
-      const payload = await response.json()
       const image = protocol === 'image2' ? extractImage2Response(payload) : extractGeminiResponse(payload)
-      const materialized = await materializeImage(image, active.maxImageBytes, exec.signal)
+      const materialized = await materializeImage(image, active.maxImageBytes, signal)
       const cwd = sessionCwd(exec)
       const outputDirectory = requireNonBlank('outputDirectory', active.outputDirectory)
       const outputPath = safeOutputPath(cwd, args.output_path, outputDirectory, materialized.extension)
       await mkdir(dirname(outputPath), { recursive: true })
-      await writeFile(outputPath, materialized.bytes, { signal: exec.signal })
+      await writeFile(outputPath, materialized.bytes, { signal })
 
       return {
         path: outputPath,
@@ -553,6 +563,9 @@ function apply(ctx, config) {
         bytes: materialized.bytes.byteLength,
         model,
         protocol,
+        elapsed_ms: Date.now() - started,
+        attempts,
+        waited_ms: waitedMs,
         ...(image.text ? { text: image.text } : {}),
       }
     },
@@ -577,6 +590,7 @@ export {
   loadRuntimeConfig,
   name,
   parseRuntimeConfig,
+  readSettings,
   resolveEndpoint,
   resolveProtocol,
   resolveRuntimeConfig,

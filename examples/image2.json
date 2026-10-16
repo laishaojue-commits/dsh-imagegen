@@ -1,0 +1,8 @@
+{
+  "protocol": "image2",
+  "url": "https://example.com/v1",
+  "apiKeyEnv": "IMAGEGEN_API_KEY",
+  "apiKeyHeader": "Authorization",
+  "apiKeyPrefix": "Bearer ",
+  "defaultModel": "gpt-image-2"
+}
